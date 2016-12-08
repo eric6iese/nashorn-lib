@@ -1,7 +1,0 @@
-{
-    "name": "nashorn-shell",
-    "version": "0.1.0",
-    "description": "Connecting to all kinds of shells and processes from within nashorn javascripting.",
-    "author": "Eric Giese <eric6iese@googlemail.com>",
-    "homepage": "https://github.com/eric6iese/nashorn-lib#readme"
-}
