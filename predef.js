@@ -45,3 +45,9 @@ if (typeof Files === 'undefined'){
 if (typeof Paths === 'undefined'){
 	var Paths =  Java.type('java.nio.file.Paths');
 }
+
+// import rhox-classpath AND overwrite the Java.type-Function with it! 
+var classpath = require("rhox-classpath");
+Java.type = classpath.type.bind(classpath);
+
+"Initialized classpath and main java classes"
