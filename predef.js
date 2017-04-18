@@ -1,10 +1,5 @@
 // Predefined global variables and functions
 
-// Module loader
-if (typeof require === 'undefined'){
-	load(__DIR__ + '/jvm-npm/jvm-npm.js');
-}
-
 // Import nashorn shell scripting extensions
 if (typeof readLine === 'undefined'){
 	function readLine(line){
@@ -23,31 +18,44 @@ if (typeof Thread === 'undefined'){
 }
 
 // java.util
+// Many favorite java classes like ArrayList from java.util
+// are _not_ imported as there are viable js Alternatives
+// (array and Java.to/from suffices)
+if (typeof Stream === 'undefined'){
+	var Stream = Java.type('java.util.stream.Stream');
+}
 if (typeof Collectors === 'undefined'){
 	var Collectors = Java.type('java.util.stream.Collectors');
 }
-// Many favorite java classes like ArrayListe from java.util
-// are not imported because there are viable js Alternatives
+if (typeof Comparator === 'undefined'){
+	var Comparator = Java.type('java.util.Comparator');
+}
 
 // java.io
 if (typeof File === 'undefined'){
-	var File =  Java.type('java.io.File');
+	var File = Java.type('java.io.File');
 }
 if (typeof Charset === 'undefined'){
-	var Charset =  Java.type('java.nio.charset.Charset');
+	var Charset = Java.type('java.nio.charset.Charset');
 }
 if (typeof StandardCharsets === 'undefined'){
-	var StandardCharsets =  Java.type('java.nio.charset.StandardCharsets');
+	var StandardCharsets = Java.type('java.nio.charset.StandardCharsets');
 }
 if (typeof Files === 'undefined'){
-	var Files =  Java.type('java.nio.file.Files');
+	var Files = Java.type('java.nio.file.Files');
 }
 if (typeof Paths === 'undefined'){
-	var Paths =  Java.type('java.nio.file.Paths');
+	var Paths = Java.type('java.nio.file.Paths');
 }
 
 // import rhox-classpath AND overwrite the Java.type-Function with it! 
-var classpath = require("rhox-classpath");
-Java.type = classpath.type.bind(classpath);
+// Module loader
+if (typeof require === 'undefined'){
+	load(__DIR__ + '/jvm-npm/jvm-npm.js');
+	(function () {
+		var classpath = require("rhox-classpath");
+		Java.type = classpath.type.bind(classpath);	
+	})();
+}
 
 "Initialized classpath and main java classes"
