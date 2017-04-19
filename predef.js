@@ -27,6 +27,9 @@ if (typeof Stream === 'undefined'){
 if (typeof Collectors === 'undefined'){
 	var Collectors = Java.type('java.util.stream.Collectors');
 }
+if (typeof Collections === 'undefined'){
+	var Collections = Java.type('java.util.Collections');
+}
 if (typeof Comparator === 'undefined'){
 	var Comparator = Java.type('java.util.Comparator');
 }
@@ -56,6 +59,23 @@ if (typeof require === 'undefined'){
 		var classpath = require("rhox-classpath");
 		Java.type = classpath.type.bind(classpath);	
 	})();
+}
+
+// Custom function:
+// Imports multiple fqn-classes with a single import statement
+if (typeof Java.import === 'undefined'){
+	var global = this;
+	function importClasses(classes){
+		classes.split(/[\s;]+/).filter(function(clazz){
+			return typeof global[name] === 'undefined';
+		}).forEach(function(clazz){
+				var type = Java.type(clazz);
+				var pos = clazz.lastIndexOf('.');
+				var name = pos == -1 ? clazz : name.substring(pos);
+				global[name] = type;			
+		});
+	}
+	Java.import = importClasses;
 }
 
 "Initialized classpath and main java classes"
