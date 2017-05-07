@@ -1,0 +1,11 @@
+{
+	"comment": "sources-> an array of source folders, target: backupbase, parallelism: number of parallel copies",
+	
+	"sources": [
+		"D:/sampleDir", "D:/sampleDir2"
+	],
+	"target": "F:/backup",
+	
+	"incremental": true,
+	"parallelism": 8
+}

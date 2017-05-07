@@ -1,0 +1,184 @@
+// Simple incremental backup script which uses hardlinks to last backup if files are unchanged
+
+// Script starting here
+// imports
+var JLong = Java.type('java.lang.Long');
+var JLongArray = Java.type('long[]');
+var JString = Java.type('java.lang.String');
+var System = Java.type('java.lang.System');
+
+var Arrays = Java.type('java.util.Arrays');
+var HashMap = Java.type('java.util.HashMap');
+
+var AtomicLong = Java.type('java.util.concurrent.atomic.AtomicLong');
+var Executors = Java.type('java.util.concurrent.Executors');
+var Callable = Java.type('java.util.concurrent.Callable');
+
+var LocalDate = Java.type('java.time.LocalDate');
+var LocalTime = Java.type('java.time.LocalDate');
+var LocalDateTime = Java.type('java.time.LocalDateTime');
+var DateTimeFormatter = Java.type('java.time.format.DateTimeFormatter');
+var Files = Java.type('java.nio.file.Files');
+var Paths = Java.type('java.nio.file.Paths');
+var SimpleFileVisitor = Java.type('java.nio.file.SimpleFileVisitor');
+var FileVisitResult = Java.type('java.nio.file.FileVisitResult');
+var FileTime = Java.type('java.nio.file.attribute.FileTime');
+var BasicFileAttributes = Java.type('java.nio.file.attribute.BasicFileAttributes');
+var StandardCopyOption = Java.type('java.nio.file.StandardCopyOption');
+
+// globals
+var config = JSON.parse(new JString(Files.readAllBytes(Paths.get('backup-config.json'))));
+var today = LocalDateTime.now().format(DateTimeFormatter.BASIC_ISO_DATE);
+
+/**
+* A found entry in step 1 in the source or last folder
+*/
+var Entry = function(file, to, attrs){
+	this.file = file;
+	this.to = to;
+	
+	var a = null;
+	if (attrs){
+		a = new JLongArray(2);
+		a[0] = attrs.lastModifiedTime().toMillis();
+		a[1] = attrs.size();
+	}
+	
+	this.attributes = a;
+}
+
+function printf(messageFormat, args) {
+	var ts = LocalDateTime.now().withNano(0).format(DateTimeFormatter.ISO_LOCAL_TIME);
+	if (args === undefined){
+		System.out.println(ts + ' ' + messageFormat);
+	} else {
+		System.out.println(ts + ' ' + JString.format(messageFormat, args));
+	}
+}
+
+function getStepSize(array){
+	if (array.length <= 100){
+		return 10;
+	} else if (array.length <= 1000){
+		return 100;
+	} else {
+		return 1000;
+	}
+}
+
+// target folders
+var targetDir = Paths.get(config.target, today);
+var lastDir = Paths.get(config.target, 'last');
+
+Files.createDirectories(targetDir);
+
+var canLink = config.incremental && Files.isDirectory(lastDir); 
+
+var threadpool = Executors.newFixedThreadPool(config.parallelism);
+
+
+/**
+* Ermittelt alle zu berücksichtigenden Dateien und Verzeichnisse
+*/
+var dirs = [];
+var files = [];
+var lastIndex = new HashMap();
+function copyOrLink(sourcePath){
+	var source = Paths.get(sourcePath);
+	var s = source.getFileName();
+	var sLastDir = lastDir.resolve(s);
+	var sTargetDir = targetDir.resolve(s);
+	
+	var Visitor = Java.extend(SimpleFileVisitor, {
+		preVisitDirectory: function(dir, attrs){
+			var from = source.relativize(dir);
+			var to = sTargetDir.resolve(from);
+			dirs.push(new Entry(dir, to, null));
+			return FileVisitResult.CONTINUE;
+		},
+		
+		visitFile: function(file, attrs){
+			var from = source.relativize(file);
+			var to = sTargetDir.resolve(from);
+			files.push(new Entry(file, to, attrs));
+			return FileVisitResult.CONTINUE;			
+		}
+	});
+
+	var LinkVisitor = Java.extend(SimpleFileVisitor, {
+		visitFile: function(file, attrs){
+			var from = source.resolve(sLastDir.relativize(file));
+			lastIndex.put(from, new Entry(file, null, attrs));
+			return FileVisitResult.CONTINUE;
+		}
+	});
+	
+	tasks = [new Callable(function() Files.walkFileTree(source, new Visitor()))];
+	
+	if (canLink){
+		tasks.push(new Callable(function() Files.walkFileTree(sLastDir, new LinkVisitor())));		
+	}
+	
+	threadpool.invokeAll(tasks).forEach(function (f) f.get());
+}
+
+
+printf('Calculate... ');
+config.sources.forEach(copyOrLink);
+printf(dirs.length + ' directories, ' + files.length + ' files');
+
+printf('Create directories..');
+var counter = new AtomicLong();
+var stepSize = getStepSize(dirs);
+dirs.forEach(function(e){
+	// Copies the dir and its attributes but not the contents
+	Files.copy(e.file, e.to, StandardCopyOption.COPY_ATTRIBUTES);
+	// Files.createDirectory(e.file);
+	
+	var pos = counter.incrementAndGet();
+	if (pos % stepSize === 0){
+		printf('%6d / %6d directories created', [pos, dirs.length]);
+	}
+});
+
+printf('Create files..');
+var counter = new AtomicLong();
+var stepSize = getStepSize(files);
+var tasks = files.map(function(e){
+	return new Callable(function(){
+		var linked = false;
+		var last = lastIndex.get(e.file);
+		if (last) {
+		
+			// check if last entry is same as this one (very likely)
+			// printf(e.file + ': ' + Arrays.toString(e.attributes) + ' = ' + Arrays.toString(last.attributes));
+			
+			if (Arrays.equals(e.attributes, last.attributes)){
+				
+				// Attributes are identical - create Link
+				// printf('Create link to ' + last.file);
+				Files.createLink(e.to, last.file);
+				linked = true;
+			}
+		}
+	
+
+		if (!linked){
+			// Not identical or nonexistant? create a copy
+			Files.copy(e.file, e.to, StandardCopyOption.COPY_ATTRIBUTES);
+		}
+
+		var pos = counter.incrementAndGet();
+		if (pos % stepSize === 0){
+			printf('%6d / %6d files created', [pos, files.length]);
+		}
+		return null;
+	});
+});
+threadpool.invokeAll(tasks).forEach(function (f) f.get());
+threadpool.shutdown();
+
+printf('Set last to new dir: %s -> %s', [lastDir, targetDir]);
+Files.deleteIfExists(lastDir);
+Files.createSymbolicLink(lastDir, targetDir);
+printf('Backup finished');
