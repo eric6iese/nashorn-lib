@@ -5,10 +5,15 @@
 var JLong = Java.type('java.lang.Long');
 var JLongArray = Java.type('long[]');
 var JString = Java.type('java.lang.String');
+var Thread = Java.type('java.lang.Thread');
 var System = Java.type('java.lang.System');
 
+
 var Arrays = Java.type('java.util.Arrays');
+var ArrayList = Java.type('java.util.ArrayList');
 var HashMap = Java.type('java.util.HashMap');
+var Collections = Java.type('java.util.Collections');
+var Collectors = Java.type('java.util.stream.Collectors');
 
 var AtomicLong = Java.type('java.util.concurrent.atomic.AtomicLong');
 var Executors = Java.type('java.util.concurrent.Executors');
@@ -27,9 +32,9 @@ var StandardCopyOption = Java.type('java.nio.file.StandardCopyOption');
 // globals
 var config = JSON.parse(new JString(Files.readAllBytes(Paths.get('backup-config.json'))));
 var today = LocalDateTime.now().format(DateTimeFormatter.BASIC_ISO_DATE);
-today = "20170511"
+ today = "20170511"
 var readSize = 10000;
-var writeSize = 1000;
+var writeSize = 10000;
 
 /**
 * A found entry in step 1 in the source or last folder
@@ -48,10 +53,12 @@ var Entry = function(file, to, attrs){
 	this.attributes = a;
 }
 
+
 var ONE_MB = 1024 * 1024;
 function toMb(bytes){
 	return (bytes / ONE_MB) | 0;
 }
+
 /**
 * Formatted Commandline output.
 */
@@ -75,20 +82,22 @@ var canLink = config.incremental && Files.isDirectory(lastDir);
 var threadpool = Executors.newFixedThreadPool(config.parallelism);
 
 /**
-* Wraps all functions in Callables and invokes them all.
+* Wraps all functions in Callables, submits them to the threadpool and waits for their completion
 */
-function runParallel(functions){
-	var tasks = functions.map(function(f) new Callable(f));
-	threadpool.invokeAll(tasks).forEach(function (f) f.get());	
+function runParallel(functionStream){
+	functionStream
+		.map(function(f) threadpool.submit(new Callable(f)))
+		.collect(Collectors.toList())
+		.forEach(function (f) f.get());	
 }
 
 printf('Calculating files and dirs for backup... ');
 var counter = new AtomicLong();
 var fullSize = 0;
-var dirs = [];
-var files = [];
+var dirs = new ArrayList();
+var files = new ArrayList();
 var lastIndex = new HashMap();
-function copyOrLink(sourcePath){
+config.sources.forEach(function(sourcePath){
 	var source = Paths.get(sourcePath);
 	var s = source.getFileName();
 	var sLastDir = lastDir.resolve(s);
@@ -98,7 +107,7 @@ function copyOrLink(sourcePath){
 		preVisitDirectory: function(dir, attrs){
 			var from = source.relativize(dir);
 			var to = sTargetDir.resolve(from);
-			dirs.push(new Entry(dir, to, null));
+			dirs.add(new Entry(dir, to, null));
 			return FileVisitResult.CONTINUE;
 		},
 		
@@ -106,7 +115,7 @@ function copyOrLink(sourcePath){
 			var from = source.relativize(file);
 			var to = sTargetDir.resolve(from);
 			var e = new Entry(file, to, attrs);
-			files.push(e);
+			files.add(e);
 			fullSize += e.attributes[0];
 			var pos = counter.incrementAndGet();
 			if (pos % readSize === 0){
@@ -124,39 +133,53 @@ function copyOrLink(sourcePath){
 		}
 	});
 	
-	var tasks = [function() Files.walkFileTree(source, new Visitor())];
+	var tasks = new ArrayList();
+	tasks.add(function() Files.walkFileTree(source, new Visitor()));
 	
 	if (canLink){
-		tasks.push(function() Files.walkFileTree(sLastDir, new LinkVisitor()));		
+		tasks.add(function() Files.walkFileTree(sLastDir, new LinkVisitor()));		
 	}
 	
-	runParallel(tasks);
-}
-config.sources.forEach(copyOrLink);
-Object.freeze(dirs);
-var dirsSize = dirs.length;
-Object.freeze(files);
-var filesSize = files.length;
+	runParallel(tasks.stream());
+});
+
+var dirsSize = dirs.size();
+var filesSize = files.size();
 
 printf(dirsSize + ' directories, ' + filesSize + ' files');
 
 printf('Create directories..');
 counter.set(0);
-dirs.forEach(function(e){
-	// Copies the dir and its attributes but not the contents
-	Files.copy(e.file, e.to, StandardCopyOption.COPY_ATTRIBUTES);
-	// Files.createDirectory(e.file);
-	
-	var pos = counter.incrementAndGet();
-	if (pos % writeSize === 0){
-		printf('%6d / %6d directories created', [pos, dirsSize]);
-	}
-});
+
+var dirMap = new HashMap();
+dirs.forEach(function(e) dirMap.put(e.file, e));
+dirMap = Collections.synchronizedMap(dirMap);
+runParallel(dirs.stream().map(function(e){
+	return function() {
+		// wait until the parent dir exists (-> is no longer in the dir index)
+		var parent = e.file.getParent();
+		while (dirMap.containsKey(parent)){
+			Thread.sleep(1);
+		}
+		
+		// Copies the dir and its attributes, but not the contents
+		Files.copy(e.file, e.to, StandardCopyOption.COPY_ATTRIBUTES);
+		// Files.createDirectory(e.file);
+
+		// Do not longer track dir
+		dirMap.remove(e.file);
+		
+		var pos = counter.incrementAndGet();
+		if (pos % writeSize === 0){
+			printf('%6d / %6d directories created', [pos, dirsSize]);
+		}
+	};
+}));
 
 printf('Create files..');
 var written = new AtomicLong();
 counter.set(0);
-var tasks = files.map(function(e){
+runParallel(files.stream().map(function(e){
 	return function(){
 		var linked = false;
 		var last = lastIndex.get(e.file);
@@ -187,8 +210,8 @@ var tasks = files.map(function(e){
 		}
 		return null;
 	};
-});
-runParallel(tasks);
+}));
+
 threadpool.shutdown();
 
 printf('Set last to new dir: %s -> %s', [lastDir, targetDir]);
