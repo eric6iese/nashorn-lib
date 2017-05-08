@@ -14,8 +14,6 @@ var AtomicLong = Java.type('java.util.concurrent.atomic.AtomicLong');
 var Executors = Java.type('java.util.concurrent.Executors');
 var Callable = Java.type('java.util.concurrent.Callable');
 
-var LocalDate = Java.type('java.time.LocalDate');
-var LocalTime = Java.type('java.time.LocalDate');
 var LocalDateTime = Java.type('java.time.LocalDateTime');
 var DateTimeFormatter = Java.type('java.time.format.DateTimeFormatter');
 var Files = Java.type('java.nio.file.Files');
@@ -29,6 +27,9 @@ var StandardCopyOption = Java.type('java.nio.file.StandardCopyOption');
 // globals
 var config = JSON.parse(new JString(Files.readAllBytes(Paths.get('backup-config.json'))));
 var today = LocalDateTime.now().format(DateTimeFormatter.BASIC_ISO_DATE);
+today = "20170511"
+var readSize = 10000;
+var writeSize = 1000;
 
 /**
 * A found entry in step 1 in the source or last folder
@@ -40,29 +41,26 @@ var Entry = function(file, to, attrs){
 	var a = null;
 	if (attrs){
 		a = new JLongArray(2);
-		a[0] = attrs.lastModifiedTime().toMillis();
-		a[1] = attrs.size();
+		a[0] = attrs.size();
+		a[1] = attrs.lastModifiedTime().toMillis();		
 	}
 	
 	this.attributes = a;
 }
 
+var ONE_MB = 1024 * 1024;
+function toMb(bytes){
+	return (bytes / ONE_MB) | 0;
+}
+/**
+* Formatted Commandline output.
+*/
 function printf(messageFormat, args) {
 	var ts = LocalDateTime.now().withNano(0).format(DateTimeFormatter.ISO_LOCAL_TIME);
 	if (args === undefined){
 		System.out.println(ts + ' ' + messageFormat);
 	} else {
 		System.out.println(ts + ' ' + JString.format(messageFormat, args));
-	}
-}
-
-function getStepSize(array){
-	if (array.length <= 100){
-		return 10;
-	} else if (array.length <= 1000){
-		return 100;
-	} else {
-		return 1000;
 	}
 }
 
@@ -76,10 +74,17 @@ var canLink = config.incremental && Files.isDirectory(lastDir);
 
 var threadpool = Executors.newFixedThreadPool(config.parallelism);
 
-
 /**
-* Ermittelt alle zu berücksichtigenden Dateien und Verzeichnisse
+* Wraps all functions in Callables and invokes them all.
 */
+function runParallel(functions){
+	var tasks = functions.map(function(f) new Callable(f));
+	threadpool.invokeAll(tasks).forEach(function (f) f.get());	
+}
+
+printf('Calculating files and dirs for backup... ');
+var counter = new AtomicLong();
+var fullSize = 0;
 var dirs = [];
 var files = [];
 var lastIndex = new HashMap();
@@ -100,7 +105,13 @@ function copyOrLink(sourcePath){
 		visitFile: function(file, attrs){
 			var from = source.relativize(file);
 			var to = sTargetDir.resolve(from);
-			files.push(new Entry(file, to, attrs));
+			var e = new Entry(file, to, attrs);
+			files.push(e);
+			fullSize += e.attributes[0];
+			var pos = counter.incrementAndGet();
+			if (pos % readSize === 0){
+				printf('%6d files read (%6dmb)', [pos, toMb(fullSize)]);
+			}
 			return FileVisitResult.CONTINUE;			
 		}
 	});
@@ -113,39 +124,40 @@ function copyOrLink(sourcePath){
 		}
 	});
 	
-	tasks = [new Callable(function() Files.walkFileTree(source, new Visitor()))];
+	var tasks = [function() Files.walkFileTree(source, new Visitor())];
 	
 	if (canLink){
-		tasks.push(new Callable(function() Files.walkFileTree(sLastDir, new LinkVisitor())));		
+		tasks.push(function() Files.walkFileTree(sLastDir, new LinkVisitor()));		
 	}
 	
-	threadpool.invokeAll(tasks).forEach(function (f) f.get());
+	runParallel(tasks);
 }
-
-
-printf('Calculate... ');
 config.sources.forEach(copyOrLink);
-printf(dirs.length + ' directories, ' + files.length + ' files');
+Object.freeze(dirs);
+var dirsSize = dirs.length;
+Object.freeze(files);
+var filesSize = files.length;
+
+printf(dirsSize + ' directories, ' + filesSize + ' files');
 
 printf('Create directories..');
-var counter = new AtomicLong();
-var stepSize = getStepSize(dirs);
+counter.set(0);
 dirs.forEach(function(e){
 	// Copies the dir and its attributes but not the contents
 	Files.copy(e.file, e.to, StandardCopyOption.COPY_ATTRIBUTES);
 	// Files.createDirectory(e.file);
 	
 	var pos = counter.incrementAndGet();
-	if (pos % stepSize === 0){
-		printf('%6d / %6d directories created', [pos, dirs.length]);
+	if (pos % writeSize === 0){
+		printf('%6d / %6d directories created', [pos, dirsSize]);
 	}
 });
 
 printf('Create files..');
-var counter = new AtomicLong();
-var stepSize = getStepSize(files);
+var written = new AtomicLong();
+counter.set(0);
 var tasks = files.map(function(e){
-	return new Callable(function(){
+	return function(){
 		var linked = false;
 		var last = lastIndex.get(e.file);
 		if (last) {
@@ -167,15 +179,16 @@ var tasks = files.map(function(e){
 			// Not identical or nonexistant? create a copy
 			Files.copy(e.file, e.to, StandardCopyOption.COPY_ATTRIBUTES);
 		}
-
+		
+		var sz = written.addAndGet(e.attributes[0]);
 		var pos = counter.incrementAndGet();
-		if (pos % stepSize === 0){
-			printf('%6d / %6d files created', [pos, files.length]);
+		if (pos % writeSize === 0){
+			printf('%10d / %10d files created (%6d / %6d mb)', [pos, filesSize, toMb(sz), toMb(fullSize)]);
 		}
 		return null;
-	});
+	};
 });
-threadpool.invokeAll(tasks).forEach(function (f) f.get());
+runParallel(tasks);
 threadpool.shutdown();
 
 printf('Set last to new dir: %s -> %s', [lastDir, targetDir]);
