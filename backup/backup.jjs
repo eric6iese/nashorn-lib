@@ -14,7 +14,7 @@ var List = Java.type('java.util.List');
 var Map = Java.type('java.util.Map');
 var ArrayList = Java.type('java.util.ArrayList');
 var HashMap = Java.type('java.util.HashMap');
-var SimpleImmutableEntry = Java.type('java.util.AbstractMap.SimpleImmutableEntry');
+var SimpleEntry = Java.type('java.util.AbstractMap.SimpleEntry');
 var Collections = Java.type('java.util.Collections');
 
 var Stream = Java.type('java.util.stream.Stream');
@@ -41,7 +41,6 @@ var AccessDeniedException = Java.type('java.nio.file.AccessDeniedException');
 // globals
 var config = JSON.parse(new JString(Files.readAllBytes(Paths.get('backup-config.json'))));
 var today = LocalDateTime.now().format(DateTimeFormatter.BASIC_ISO_DATE);
- today = '20170512'
 
 // global dirs
 var targetDir = Paths.get(config.target, today);
@@ -92,6 +91,9 @@ var Source = {
 
 
 var DIR_ATTRIBUTES = new JLongArray(3);
+DIR_ATTRIBUTES[0] = 1;
+var LINK_ATTRIBUTES = new JLongArray(3);
+LINK_ATTRIBUTES[0] = 1;
 
 /**
 * Wrapper functions to handle the Entry as a memory-efficient pseudo-object based on an internal java structures.
@@ -103,7 +105,7 @@ var Entry = {
 	* Creates a file entry found in step 1 in the source or last folder.
 	*/
 	create: function (file, attrs, target) {
-		return new SimpleImmutableEntry(file.toString(), Entry.createAttributes(attrs));
+		return new SimpleEntry(file.toString(), Entry.createAttributes(attrs));
 	},
 	
 	/**
@@ -137,10 +139,12 @@ var Entry = {
 		var attributes = entry.value;
 		// printf('%s: %s = %s', entry.key, Arrays.toString(attributes), Arrays.toString(otherAttributes));
 		
-		// the last modified time is hacked into a link identifier:
-		// - if it is 1, a link will be created
-		// - if it is 0, a normal copy occurs (as in dirs)
-		attributes[2] = Arrays.equals(attributes, otherAttributes) ? 1 : 0;
+		// if the file is identical, the link attributes whill be used:
+		// - then link will be created
+		// - otherwise a normal copy occurs (as in dirs)
+		if (Arrays.equals(attributes, otherAttributes)){
+			entry.value = LINK_ATTRIBUTES;
+		}
 	},
 	
 	/**
@@ -150,7 +154,7 @@ var Entry = {
 		var attributes = entry.value;
 		
 		var target = Entry.target(entry);
-		if (attributes[2] === 1){
+		if (attributes === LINK_ATTRIBUTES) {
 			var last = Entry.last(entry);
 			// printf('Create link: %s -> %s', target, last);
 			Files.createLink(target, last);
@@ -159,7 +163,7 @@ var Entry = {
 		var src = Entry.source(entry);
 		// printf('Copy: %s -> %s', src, target);
 		Files.copy(src, target, StandardCopyOption.COPY_ATTRIBUTES);
-		if (Entry.isDirectory(entry)){
+		if (attributes === DIR_ATTRIBUTES){
 			return;
 		}
 		// the creation time is not automatically copied on windows (ntfs) for regular files
@@ -299,7 +303,7 @@ function processSource(sourceDir){
 	Source.target = targetDir.resolve(sourceName);
 	Source.last = lastDir.resolve(sourceName);
 	
-	printf('%s Check files and dirs for backup...', sourceDir);
+	printf('%s Check files and dirs for backup...', sourceName);
 	var size = new AtomicLong();
 	var count = new AtomicLong();
 	var readCounter = function(entry) {
@@ -325,8 +329,14 @@ function processSource(sourceDir){
 		}
 	});
 	
+	var byteSize = size.get();
+	var byteSizeInMb = toMb(byteSize);
+	var filesSize = writeTasks.size();
+	printf('%6d files read (%6d MB)', filesSize, byteSizeInMb);
+	
 	// evaluate lastIndex
 	if (lastIndex){
+		size.set(0);
 		writeTasks.forEach(function(entry){
 			if (Entry.isDirectory(entry)){
 				return;
@@ -337,17 +347,17 @@ function processSource(sourceDir){
 			if (last !== null) {
 				Entry.updateAttributes(entry, last);
 			}
+			size.addAndGet(Entry.size(entry));
 		});
 		// lastIndex can be gc'ed
 		lastIndex = null;
+		var oldSize = byteSizeInMb;
+		byteSize = size.get();
+		byteSizeInMb = toMb(byteSize);
+		printf('Some of the files will be hardlinked instead of copied (%d -> %d MB)', oldSize, byteSizeInMb);
 	}
 	
-	var byteSize = size.get();
-	var byteSizeInMb = toMb(byteSize);
-	var filesSize = writeTasks.size();
-	printf('%6d files read (%6d MB)', filesSize, byteSizeInMb);
-	
-	printf('%s Create %s files and directories (%d MB)...', sourceDir, filesSize, byteSizeInMb);
+	printf('%s Create %s files and directories (%d MB)...', sourceName, filesSize, byteSizeInMb);
 	
 	// System.gc();
 	// System.console().readLine('Hit enter to continue');
