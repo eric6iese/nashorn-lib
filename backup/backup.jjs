@@ -34,6 +34,7 @@ var FileTime = Java.type('java.nio.file.attribute.FileTime');
 // globals
 var config = JSON.parse(new JString(Files.readAllBytes(Paths.get('backup-config.json'))));
 var today = LocalDateTime.now().format(DateTimeFormatter.BASIC_ISO_DATE);
+ today = '20170511'
 
 var readSize = 10000;
 var writeSize = 10000;
@@ -51,22 +52,20 @@ function printf(messageFormat) {
 	out.println(msg);
 }
 
-/**
-* A file entry found in step 1 in the source or last folder
-*/
-var EMPTY_DIR_ATTRIBUTES = new JLongArray(3);
-var Entry = function(file, attrs, target){
+var EMPTY_DIR_ATTRIBUTES = new JLongArray(4);
+var FileEntry = function(file, attrs, target){
 	this.file = file;
 
 	// attributes
-	this.directory = attrs.isDirectory();
-	if (this.directory){
+	var dir = attrs.isDirectory();
+	if (dir){
 		this.attributes = EMPTY_DIR_ATTRIBUTES;
 	} else {
-		var a = new JLongArray(3);
-		a[0] = attrs.size();
-		a[1] = attrs.creationTime().toMillis();
-		a[2] = attrs.lastModifiedTime().toMillis();
+		var a = new JLongArray(4);
+		a[0] = 1;
+		a[1] = attrs.size();
+		a[2] = attrs.creationTime().toMillis();
+		a[3] = attrs.lastModifiedTime().toMillis();
 		this.attributes = a;
 	}
 	
@@ -75,34 +74,55 @@ var Entry = function(file, attrs, target){
 		this.target = target;
 	}
 }
-Entry.prototype.size = function() {
-	return this.attributes[0];
-}
 /**
-* Check if the other entry has the same attributes as this one
+* Wrapper functions to handle the Entry as a memory-efficient pseudo-object based on an internal java structure.
+* This is needed as we will create a lot of these entries. Millions for large backups.
 */
-Entry.prototype.hasEqualAttributes = function(other) {
-	// printf('%s: %s = %s', this.file, Arrays.toString(this.attributes), Arrays.toString(other.attributes));
-	return Arrays.equals(this.attributes, other.attributes);
-}
-/**
-* Copies to the target.
-*/
-Entry.prototype.copy = function(){
-	Files.copy(this.file, this.target, StandardCopyOption.COPY_ATTRIBUTES);
-	if (this.directory){		
-		return;
+var Entry = {
+
+	/**
+	* Creates a file entry found in step 1 in the source or last folder.
+	*/
+	create: function (file, attrs, target) {
+		return new FileEntry(file, attrs, target);
+	},
+
+	file: function(entry) entry.file,
+
+	isRegularFile: function(entry) (entry.attributes[0] & 1) === 1,
+	
+	isDirectory: function(entry) (entry.attributes[0] & 1) !== 1,
+	
+	size: function(entry) entry.attributes[1],
+
+	/**
+	* Check if the other entry has the same attributes as this one
+	*/	
+	hasEqualAttributes: function(entry, other) {
+		// printf('%s: %s = %s', entry.file, Arrays.toString(entry.attributes), Arrays.toString(other.attributes));
+		return Arrays.equals(entry.attributes, other.attributes);
+	},
+	
+	/**
+	* Copies to the target.
+	*/
+	copy: function(entry){
+		Files.copy(entry.file, entry.target, StandardCopyOption.COPY_ATTRIBUTES);
+		if (Entry.isDirectory(entry)){		
+			return;
+		}
+		// the creation time is not automatically copied on windows (ntfs) for regular files
+		// (no problem with directories, which is a bit strange)
+		var creationTime = FileTime.fromMillis(entry.attributes[2]);
+		Files.setAttribute(entry.target, 'creationTime', creationTime);
+		// var result = Files.getAttribute(entry.target, 'creationTime');
+		// printf('%s: set creationTime to %s. Result: %s', entry.file, creationTime, result);
+	},
+	
+	createLink: function(entry, targetFile){
+		// printf('Create link: %s -> %s', entry.target, targetFile);
+		Files.createLink(entry.target, targetFile);
 	}
-	// the creation time is not automatically copied on windows (ntfs) for regular files
-	// (no problem with directories, which is a bit strange)
-	var creationTime = FileTime.fromMillis(this.attributes[1]);
-	Files.setAttribute(this.target, 'creationTime', creationTime);
-	// var result = Files.getAttribute(this.target, 'creationTime');
-	// printf('%s: set creationTime to %s. Result: %s', this.file, creationTime, result);
-}
-Entry.prototype.createLink = function(targetFile){
-	// printf('Create link: %s -> %s', this.target, targetFile);
-	Files.createLink(this.target, targetFile);
 }
 
 var ONE_MB = 1024 * 1024;
@@ -148,18 +168,18 @@ function readSourceDirectory(source, updateFunction){
 	var Visitor = Java.extend(SimpleFileVisitor, {
 		preVisitDirectory: function(dir, attrs){
 			var target = sTargetDir.resolve(source.relativize(dir));
-			var e = new Entry(dir, attrs, target);
-			files.add(e);
+			var entry = Entry.create(dir, attrs, target);
+			files.add(entry);
 			parentDirs.add(dir);
-			updateFunction(e);
+			updateFunction(entry);
 			return FileVisitResult.CONTINUE;
 		},
 		
 		visitFile: function(file, attrs){
 			var target = sTargetDir.resolve(source.relativize(file));
-			var e = new Entry(file, attrs, target);
-			files.add(e);
-			updateFunction(e);
+			var entry = Entry.create(file, attrs, target);
+			files.add(entry);
+			updateFunction(entry);
 			return FileVisitResult.CONTINUE;
 		}
 	});
@@ -174,7 +194,7 @@ function readLastDirectory(source){
 	var Visitor = Java.extend(SimpleFileVisitor, {
 		visitFile: function(file, attrs){
 			var sourceFile = source.resolve(sLastDir.relativize(file));
-			lastIndex.put(sourceFile, new Entry(file, attrs));
+			lastIndex.put(sourceFile, Entry.create(file, attrs));
 			return FileVisitResult.CONTINUE;
 		}
 	});
@@ -187,30 +207,30 @@ function readLastDirectory(source){
 */
 function createFile(entry){
 	// wait until the parent dir exists (-> is no longer in the dir index)
-	var parent = entry.file.getParent();
+	var parent = Entry.file(entry).getParent();
 	while (parentDirs.contains(parent)){
 		Thread.sleep(1);
 	}
 	
 	// create dir or file
-	if (entry.directory){
+	if (Entry.isDirectory(entry)){
 		// Creates the dir with the original attributes, but not its contents
-		entry.copy();	
+		Entry.copy(entry);	
 		// Do not longer track parentDir as nonexistant
-		parentDirs.remove(entry.file);
+		parentDirs.remove(Entry.file(entry));
 		return;
 	}
 	
 	// regular file: check if an identical backup exists. if so, then create a hardlink
-	var last = lastIndex.get(entry.file);
-	if (last && entry.hasEqualAttributes(last)){			
+	var last = lastIndex.get(Entry.file(entry));
+	if (last && Entry.hasEqualAttributes(entry, last)){			
 		// Attributes are identical - create Link
-		entry.createLink(last.file);
+		Entry.createLink(entry, last.file);
 		return;
 	}
 	
  	// Not identical or nonexistant? create a copy
-	entry.copy();
+	Entry.copy(entry);
 }
 
 
@@ -222,7 +242,7 @@ try {
 	var size = new AtomicLong();
 	var count = new AtomicLong();
 	var readCounter = function(entry) {
-		var sz = size.addAndGet(entry.size());
+		var sz = size.addAndGet(Entry.size(entry));
 		var pos = count.incrementAndGet();
 		if (pos % readSize === 0){
 			printf('%6d files read (%6d MB)', pos, toMb(sz));
@@ -250,7 +270,7 @@ try {
 	size.set(0);
 	count.set(0);
 	var writeCounter = function(entry){
-		var sz = size.addAndGet(entry.size());
+		var sz = size.addAndGet(Entry.size(entry));
 		var pos = count.incrementAndGet();
 		if (pos % writeSize === 0){
 			printf('%10d / %10d files created (%6d / %6d MB)', pos, files.size(), toMb(sz), byteSizeInMb);
