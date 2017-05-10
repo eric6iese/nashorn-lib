@@ -21,6 +21,7 @@ var Stream = Java.type('java.util.stream.Stream');
 var DoubleStream = Java.type('java.util.stream.DoubleStream');
 var Collectors = Java.type('java.util.stream.Collectors');
 
+var Future = Java.type('java.util.concurrent.Future');
 var ConcurrentHashMap = Java.type('java.util.concurrent.ConcurrentHashMap');
 var AtomicLong = Java.type('java.util.concurrent.atomic.AtomicLong');
 var Executors = Java.type('java.util.concurrent.Executors');
@@ -132,17 +133,23 @@ var Entry = {
 	size: function(entry) entry.value[0],
 
 	/**
+	* Checks if two attributes are identical
+	*/
+	sameAttributes: function(entry, otherAttributes) {
+		return Arrays.equals(entry.value, otherAttributes);
+	},
+	
+	/**
 	* Check if the other entry has the same attributes as this one.
 	* If so, then the copy step will create a link.
 	*/	
 	updateAttributes: function(entry, otherAttributes) {
-		var attributes = entry.value;
-		// printf('%s: %s = %s', entry.key, Arrays.toString(attributes), Arrays.toString(otherAttributes));
+		// printf('%s: %s = %s', entry.key, Arrays.toString(entry.value), Arrays.toString(otherAttributes));
 		
 		// if the file is identical, the link attributes whill be used:
 		// - then link will be created
 		// - otherwise a normal copy occurs (as in dirs)
-		if (Arrays.equals(attributes, otherAttributes)){
+		if (Entry.sameAttributes(entry, otherAttributes)){
 			entry.value = LINK_ATTRIBUTES;
 		}
 	},
@@ -163,6 +170,7 @@ var Entry = {
 		// Copy the file or dir with all attributes
 		// DirContents are NOT copied by this method
 		var src = Entry.source(entry);
+		
 		// printf('Copy: %s -> %s', src, target);
 		Files.copy(src, target, StandardCopyOption.COPY_ATTRIBUTES);		
 		
@@ -182,23 +190,41 @@ var Entry = {
 * Wraps all functions in Callables, submits them to the threadpool and waits for their completion
 */
 var threadpool = null;
-function runParallel(functionList, resultFunction){
-	functionList.replaceAll(function(f) threadpool.submit(new Callable(f)));
+function runParallel(functionList){
+	functionList.replaceAll(function(f) {
+		var future = threadpool.submit(new Callable(f));
+		return !f.onComplete ? future : [future, f.onComplete];
+	});
 	functionList.replaceAll(function (f) {
+		var future;
+		var onComplete;
+		if (f instanceof Future){
+			future = f;
+			onComplete = null;
+		} else {
+			future = f[0];
+			onComplete = f[1];
+		}
+		var result;
 		try {
-			var result = f.get();
-			if (resultFunction){
-				resultFunction(result);
-			}
+			result = future.get();
 		} catch (ex) {
+			// unwrap the execution exception
+			if (ex.getCause() != null){
+				ex = ex.getCause();
+			}
 			ex.printStackTrace();
+		}
+		if (onComplete){
+			try {
+				onComplete(result);
+			} catch (ex) {
+				ex.printStackTrace();
+			}
 		}
 		return null;
 	});
 }
-
-// the target dir to write to
-Files.createDirectories(targetDir);
 
 // If any of the file walks fails, the corresponding exceptions are handled here
 function visitFileFailed(file, ioe){
@@ -213,7 +239,7 @@ function visitFileFailed(file, ioe){
 // tracks which parent dirs do not yet exist (for next step)
 var parentDirs = Collections.newSetFromMap(new ConcurrentHashMap());
 function readSourceDirectory(baseDir, updateFunction){
-	parentDirs.clear();
+
 	
 	// the list of files (the result)
 	var first = true;
@@ -227,7 +253,6 @@ function readSourceDirectory(baseDir, updateFunction){
 				return FileVisitResult.CONTINUE;
 			}
 			var entry = Entry.create(baseDir.relativize(dir), attrs);
-			parentDirs.add(Entry.file(entry));
 			files.add(entry);
 			updateFunction(entry);
 			return FileVisitResult.CONTINUE;
@@ -274,27 +299,53 @@ function readLastDirectory(baseDir){
 	return lastIndex;
 }
 
+function readExistingDirectory(baseDir) {
+	if (!Files.isDirectory(baseDir)){
+		return null;
+	}
+	var result = new HashMap();
+	var ExistingVisitor = Java.extend(SimpleFileVisitor, {
+		
+		preVisitDirectory: function(dir, attrs){
+			result.put(baseDir.relativize(dir).toString(), DIR_ATTRIBUTES);
+			return FileVisitResult.CONTINUE;
+		},
+		
+		visitFile: function(file, attrs){
+			result.put(baseDir.relativize(file).toString(), Entry.createAttributes(attrs));
+			return FileVisitResult.CONTINUE;
+		},
+		
+		visitFileFailed: visitFileFailed
+	})
+	Files.walkFileTree(baseDir, new ExistingVisitor());
+	return result;
+}
+
 /**
 * First waits for the existence of the parent dir, then copies either the file or the directory (without content)
 */
 function createFile(entry){
 	var file = Entry.file(entry);
-	if (!file.isEmpty()){
-		var parent = Objects.toString(new File(file).getParent(), '');
-		// printf("%s, parent: %s", file, parent);
+	try {
 		// wait until the parent dir exists (-> is no longer in the dir index)
-		while (parentDirs.contains(parent)){
-			Thread.sleep(1);
+		if (!file.isEmpty()){
+			var parent = Objects.toString(new File(file).getParent(), '');
+			// printf("%s, parent: %s", file, parent);
+			while (parentDirs.contains(parent)){
+				Thread.sleep(1);
+			}
 		}
-	}
-	
-	// create or link the file / dir
-	Entry.copy(entry);	
-	
-	// if this was a dir, then track it no longer
-	if (Entry.isDirectory(entry)){	
-		// Do not longer track parentDir as nonexistant
-		parentDirs.remove(file);
+		
+		// create or link the file / dir
+		Entry.copy(entry);	
+		
+	} finally {
+		// if this was a dir, then do not track it any longer
+		if (Entry.isDirectory(entry)){	
+			// Do not longer track parentDir as nonexistant
+			parentDirs.remove(file);
+		}
 	}
 }
 
@@ -331,27 +382,67 @@ function processSource(sourceDir){
 	}
 	
 	// prepare tasks
-	var readTasks = Arrays.asList(
-		function() readSourceDirectory(sourceDir, readCounter),
-		function() readLastDirectory(Source.last)
-	);
+	var readSource = function() readSourceDirectory(sourceDir, readCounter);
 	var writeTasks = null;
+	readSource.onComplete = function(result){
+		writeTasks = result;
+	};
+	
+	var readLast = function() readLastDirectory(Source.last);
 	var lastIndex = null;
-	runParallel(readTasks, function(result){
-		if (result instanceof List){
-			writeTasks = result;
-		} else if (result instanceof Map){
-			lastIndex = result;
-		}
-	});
+	readLast.onComplete = function(result){
+		lastIndex = result;
+	};
+	
+	var readExisting = function() readExistingDirectory(Source.target);
+	var existIndex = null;
+	readExisting.onComplete = function(result){
+		existIndex = result;
+	};
+	runParallel(Arrays.asList(readSource, readLast, readExisting));
 	
 	var byteSize = size.get();
 	var byteSizeInMb = toMb(byteSize);
 	var filesSize = writeTasks.size();
 	printf('%6d files read (%6d MB)', filesSize, byteSizeInMb);
 	
+	if (!existIndex){
+		printf('Number of existing files: %d', existIndex.size());
+		
+		// create base target dir
+		if (sourceIsRoot){
+			// Cannot copy an fs-root, just create a new directory
+			Files.createDirectory(Source.target);
+		} else {
+			// Copy the dir with attributes (but not contents)
+			Files.copy(sourceDir, Source.target, StandardCopyOption.COPY_ATTRIBUTES);
+		}
+	} else {
+		size.set(0);
+		// evaluate existing
+		writeTasks = writeTasks.parallelStream().filter(function(entry){
+			var attr = existIndex.get(Entry.file(entry));
+			if (attr !== null && Entry.sameAttributes(entry, attr)){
+				return false;
+			}
+			size.addAndGet(Entry.size(entry));
+			return true;
+		}).collect(Collectors.toList());
+		
+		// existing can be gc'ed
+		existIndex = null;
+		
+		var oldSize = byteSizeInMb;
+		byteSize = size.get();
+		byteSizeInMb = toMb(byteSize);
+		printf('Some of the files are already existing (Count: %d -> %d, Size: %d -> %d MB) from %s', filesSize, writeTasks.size(), oldSize, byteSizeInMb, Source.last);
+		filesSize = writeTasks.size();
+	}
+	
 	// evaluate lastIndex
 	if (lastIndex){
+		printf('Number of last files: %d', lastIndex.size());
+		
 		size.set(0);
 		writeTasks.parallelStream().forEach(function(entry){
 			if (Entry.isDirectory(entry)){
@@ -375,14 +466,13 @@ function processSource(sourceDir){
 	
 	printf('%s: Create %s files and directories (%d MB) in %s...', sourceName, filesSize, byteSizeInMb, Source.target);
 	
-	// create base target dir
-	if (sourceIsRoot){
-		// Cannot copy an fs-root, just create a new directory
-		Files.createDirectory(Source.target);
-	} else {
-		// Copy the dir with attributes (but not contents)
-		Files.copy(sourceDir, Source.target, StandardCopyOption.COPY_ATTRIBUTES);
-	}
+	// evaluate parent dirs
+	parentDirs.clear();
+	writeTasks.parallelStream().forEach(function(entry){
+		if (Entry.isDirectory(entry)){
+			parentDirs.add(Entry.file(entry));
+		}
+	});
 	
 	// System.gc();
 	// System.console().readLine('Hit enter to continue');
@@ -412,6 +502,9 @@ function processSource(sourceDir){
 	printf('%10d / %10d files created (%6d / %6d MB).', count.get(), filesSize, toMb(size.get()), byteSizeInMb);
 	printf('%s: Done.', sourceDir);
 }
+
+// the target dir to write to
+Files.createDirectories(targetDir);
 
 // Start the threadpool and do stuff!
 threadpool = Executors.newFixedThreadPool(Math.max(1, config.parallelism));
