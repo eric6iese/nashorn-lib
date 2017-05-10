@@ -25,6 +25,7 @@ var ConcurrentHashMap = Java.type('java.util.concurrent.ConcurrentHashMap');
 var AtomicLong = Java.type('java.util.concurrent.atomic.AtomicLong');
 var Executors = Java.type('java.util.concurrent.Executors');
 var Callable = Java.type('java.util.concurrent.Callable');
+var CompletableFuture = Java.type('java.util.concurrent.CompletableFuture');
 
 var LocalDateTime = Java.type('java.time.LocalDateTime');
 var DateTimeFormatter = Java.type('java.time.format.DateTimeFormatter');
@@ -47,7 +48,7 @@ var targetDir = Paths.get(config.target, today);
 var lastDir = Paths.get(config.target, 'last');
 
 var readSize = 10000;
-var writeSize = 10000;
+var writeSize = 1000;
 
 var ONE_MB = 1024 * 1024;
 function toMb(bytes){
@@ -59,20 +60,19 @@ function toMb(bytes){
 */
 function formatTime(millis){
 	var seconds = millis / 1000;
-	var hours = seconds / 3600;
+	var hours = Math.min(99, seconds / 3600);
 	seconds %= 3600;
 	var minutes = seconds / 60;
 	seconds %= 60;
 	return JString.format('%02d:%02d:%02d', hours|0, minutes|0, seconds|0);
 }
 
-var startTime = System.currentTimeMillis();
 var out = System.out;
 /**
 * Formatted Commandline output.
 */
 function printf(messageFormat) {
-	var msg = formatTime(System.currentTimeMillis() - startTime) + ' ' + messageFormat;
+	var msg = LocalDateTime.now().withNano(0).format(DateTimeFormatter.ISO_TIME) + ' ' + messageFormat;
 	if (arguments.length > 1) {
 		msg = JString.format(msg, Array.prototype.slice.call(arguments, 1));
 	}
@@ -159,19 +159,22 @@ var Entry = {
 			// printf('Create link: %s -> %s', target, last);
 			Files.createLink(target, last);
 			return;
-		}
+		} 
+		// Copy the file or dir with all attributes
+		// DirContents are NOT copied by this method
 		var src = Entry.source(entry);
 		// printf('Copy: %s -> %s', src, target);
-		Files.copy(src, target, StandardCopyOption.COPY_ATTRIBUTES);
-		if (attributes === DIR_ATTRIBUTES){
-			return;
-		}
+		Files.copy(src, target, StandardCopyOption.COPY_ATTRIBUTES);		
+		
 		// the creation time is not automatically copied on windows (ntfs) for regular files
 		// (no problem with directories, which is a bit strange)
+		if (attributes === DIR_ATTRIBUTES) {
+			return;
+		}
 		var creationTime = FileTime.fromMillis(attributes[1]);
 		Files.setAttribute(target, 'creationTime', creationTime);
 		// var result = Files.getAttribute(target, 'creationTime');
-		// printf('%s: set creationTime to %s. Result: %s', target, creationTime, result);
+		// printf('%s: set creationTime to %s. Result: %s', target, creationTime, result);	
 	}
 }
 
@@ -213,10 +216,16 @@ function readSourceDirectory(baseDir, updateFunction){
 	parentDirs.clear();
 	
 	// the list of files (the result)
+	var first = true;
 	var files = new ArrayList();
 	var SourceVisitor = Java.extend(SimpleFileVisitor, {
 		
 		preVisitDirectory: function(dir, attrs){
+			// Skip first entry (root dir)
+			if (first){
+				first = false;
+				return FileVisitResult.CONTINUE;
+			}
 			var entry = Entry.create(baseDir.relativize(dir), attrs);
 			parentDirs.add(Entry.file(entry));
 			files.add(entry);
@@ -289,21 +298,28 @@ function createFile(entry){
 	}
 }
 
+
+
 function processSource(sourceDir){
 	sourceDir = Paths.get(sourceDir);
-	var sourceName = sourceDir.getFileName();
 	// In the case of a filesystem root, a root alias is used
-	if (sourceName === null && sourceDir.getRoot().equals(sourceDir)){		
+	var sourceIsRoot = sourceDir.getRoot().equals(sourceDir);
+	var sourceName;
+	if (sourceIsRoot) {
 		sourceName = sourceDir.toString().replaceAll('[:/\\\\]', '');
 		if (sourceName.isEmpty()){
 			sourceName = 'ROOT';
 		}
+	} else {
+		sourceName = sourceDir.getFileName();
 	}
 	Source.path = sourceDir;
 	Source.target = targetDir.resolve(sourceName);
 	Source.last = lastDir.resolve(sourceName);
 	
-	printf('%s Check files and dirs for backup...', sourceName);
+	printf('Create backup from %s %s to %s', sourceIsRoot ? 'filesystem' : 'directory', sourceDir, Source.target);
+	
+	printf('%s: Check files and dirs for backup...', sourceName);
 	var size = new AtomicLong();
 	var count = new AtomicLong();
 	var readCounter = function(entry) {
@@ -337,7 +353,7 @@ function processSource(sourceDir){
 	// evaluate lastIndex
 	if (lastIndex){
 		size.set(0);
-		writeTasks.forEach(function(entry){
+		writeTasks.parallelStream().forEach(function(entry){
 			if (Entry.isDirectory(entry)){
 				return;
 			}
@@ -354,27 +370,37 @@ function processSource(sourceDir){
 		var oldSize = byteSizeInMb;
 		byteSize = size.get();
 		byteSizeInMb = toMb(byteSize);
-		printf('Some of the files will be hardlinked instead of copied (%d -> %d MB)', oldSize, byteSizeInMb);
+		printf('Some of the files will be hardlinked instead of copied (%d -> %d MB) from %s', oldSize, byteSizeInMb, Source.last);
 	}
 	
-	printf('%s Create %s files and directories (%d MB)...', sourceName, filesSize, byteSizeInMb);
+	printf('%s: Create %s files and directories (%d MB) in %s...', sourceName, filesSize, byteSizeInMb, Source.target);
+	
+	// create base target dir
+	if (sourceIsRoot){
+		// Cannot copy an fs-root, just create a new directory
+		Files.createDirectory(Source.target);
+	} else {
+		// Copy the dir with attributes (but not contents)
+		Files.copy(sourceDir, Source.target, StandardCopyOption.COPY_ATTRIBUTES);
+	}
 	
 	// System.gc();
 	// System.console().readLine('Hit enter to continue');
 	size.set(0);
 	count.set(0);
+	var startTime = System.currentTimeMillis();
 	var writeCounter = function(entry){
 		var sz = size.addAndGet(Entry.size(entry));
 		var pos = count.incrementAndGet();
 		if (pos % writeSize === 0){
-			var timeTaken = System.currentTimeMillis() - this.startTime;
-			var timeBySize = ((byteSize / sz) * timeTaken) - timeTaken;
-			var timeByFiles = ((filesSize / pos) * timeTaken) - timeTaken;
-			var timeEstimate = DoubleStream.of(timeBySize, timeByFiles).average().getAsDouble();			
-			printf('%10d / %10d files created (%6d / %6d MB). Remaining: %s', pos, filesSize, toMb(sz), byteSizeInMb, formatTime(timeEstimate));
+			var timeTaken = System.currentTimeMillis() - startTime;
+			var timeBySize = (byteSize / sz) * timeTaken;
+			var timeByFiles = (filesSize / pos) * timeTaken;
+			var timeEstimate = DoubleStream.of(timeBySize, timeByFiles).average().getAsDouble();
+			var timeRemaining = timeEstimate - timeTaken;
+			printf('%10d / %10d files created (%6d / %6d MB). Time: %s / %s. Remaining: %s', pos, filesSize, toMb(sz), byteSizeInMb, formatTime(timeTaken), formatTime(timeEstimate), formatTime(timeRemaining));
 		}
 	}
-	writeCounter.startTime = System.currentTimeMillis();
 	
 	writeTasks.replaceAll(function(entry){
 		return function() {
@@ -384,7 +410,7 @@ function processSource(sourceDir){
 	});
 	runParallel(writeTasks);
 	printf('%10d / %10d files created (%6d / %6d MB).', count.get(), filesSize, toMb(size.get()), byteSizeInMb);
-	printf('%s Done.', sourceDir);
+	printf('%s: Done.', sourceDir);
 }
 
 // Start the threadpool and do stuff!
