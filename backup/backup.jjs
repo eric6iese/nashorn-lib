@@ -5,8 +5,9 @@
 var JLong = Java.type('java.lang.Long');
 var JLongArray = Java.type('long[]');
 var JString = Java.type('java.lang.String');
-var Thread = Java.type('java.lang.Thread');
 var System = Java.type('java.lang.System');
+var Runnable = Java.type('java.lang.Runnable');
+var Thread = Java.type('java.lang.Thread');
 var Runtime = Java.type('java.lang.Runtime');
 
 var Objects = Java.type('java.util.Objects');
@@ -22,6 +23,7 @@ var Stream = Java.type('java.util.stream.Stream');
 var DoubleStream = Java.type('java.util.stream.DoubleStream');
 var Collectors = Java.type('java.util.stream.Collectors');
 
+var TimeUnit = Java.type('java.util.concurrent.TimeUnit');
 var Future = Java.type('java.util.concurrent.Future');
 var ConcurrentHashMap = Java.type('java.util.concurrent.ConcurrentHashMap');
 var AtomicLong = Java.type('java.util.concurrent.atomic.AtomicLong');
@@ -44,16 +46,19 @@ var AccessDeniedException = Java.type('java.nio.file.AccessDeniedException');
 // globals
 var config = JSON.parse(new JString(Files.readAllBytes(Paths.get('backup-config.json'))));
 var today = LocalDateTime.now().format(DateTimeFormatter.BASIC_ISO_DATE);
+ today = '20170512'
 
 // global threadpool with daemon threads, auto-closed on JVM-shutdown
 var threadpool = Executors.newFixedThreadPool(Math.max(1, config.parallelism), function(runnable){
 	var t = new Thread(runnable);
-	t.setDameon(true);
+	t.setDaemon(true);
 	return t;
 });
-Runtime.getRuntime().addShutdownHook(new Thread(new Runnable(new function() {
+Runtime.getRuntime().addShutdownHook(new Thread(new Runnable(function() {
 	threadpool.shutdown();
-	threadpool.awaitTermination(60, TimeUnit.SECONDS);
+	threadpool.awaitTermination(1, TimeUnit.SECONDS);
+	threadpool.shutdownNow();
+	threadpool.awaitTermination(1, TimeUnit.SECONDS);
 })));
 
 // global dirs
@@ -80,7 +85,6 @@ function formatTime(millis){
 	return JString.format('%02d:%02d:%02d', hours|0, minutes|0, seconds|0);
 }
 
-var out = System.out;
 /**
 * Formatted Commandline output.
 */
@@ -89,7 +93,7 @@ function printf(messageFormat) {
 	if (arguments.length > 1) {
 		msg = JString.format(msg, Array.prototype.slice.call(arguments, 1));
 	}
-	out.println(msg);
+	System.out.println(msg);
 }
 
 /**
@@ -171,26 +175,27 @@ var Entry = {
 	*/
 	copy: function(entry){
 		var attributes = entry.value;
-		
 		var target = Entry.target(entry);
 		if (attributes === LINK_ATTRIBUTES) {
+			
 			var last = Entry.last(entry);
 			// printf('Create link: %s -> %s', target, last);
 			Files.createLink(target, last);
 			return;
-		} 
-		// Copy the file or dir with all attributes
-		// DirContents are NOT copied by this method
+			
+		}
 		var src = Entry.source(entry);
-		
+		if (attributes === DIR_ATTRIBUTES) {
+			// printf('Create Directory: %s -> %s', src, target);
+			Files.copy(src, target, StandardCopyOption.COPY_ATTRIBUTES);
+			return;
+		}
+			
 		// printf('Copy: %s -> %s', src, target);
-		Files.copy(src, target, StandardCopyOption.COPY_ATTRIBUTES);		
+		Files.copy(src, target, StandardCopyOption.COPY_ATTRIBUTES, StandardCopyOption.REPLACE_EXISTING);		
 		
 		// the creation time is not automatically copied on windows (ntfs) for regular files
 		// (no problem with directories, which is a bit strange)
-		if (attributes === DIR_ATTRIBUTES) {
-			return;
-		}
 		var creationTime = FileTime.fromMillis(attributes[1]);
 		Files.setAttribute(target, 'creationTime', creationTime);
 		// var result = Files.getAttribute(target, 'creationTime');
@@ -198,25 +203,33 @@ var Entry = {
 	}
 }
 
-// If any of the file walks fails, the corresponding exceptions are handled here
-function visitFileFailed(file, ioe){
-	if (ioe instanceof AccessDeniedException){
-		printf('Skip file %s (not accessible)', file);
-	} else {
-		ioe.printStackTrace();
+/**
+* Walks through the file tree using the visitor options.
+* Errors are automatically logged.
+*/
+function visitFileTree(baseDir, visitor){
+	// If any of the file walks fails, the corresponding exceptions are handled here
+	visitor.visitFileFailed = function(file, ioe){
+		if (ioe instanceof AccessDeniedException){
+			printf('Skip file %s (not accessible)', file);
+		} else {
+			ioe.printStackTrace();
+		}
+		return FileVisitResult.CONTINUE;
 	}
-	return FileVisitResult.CONTINUE;
+	var Visitor = Java.extend(SimpleFileVisitor, visitor);
+	Files.walkFileTree(baseDir, new Visitor());
 }
 
 // tracks which parent dirs do not yet exist (for next step)
 var parentDirs = Collections.newSetFromMap(new ConcurrentHashMap());
 function readSourceDirectory(baseDir, updateFunction){
-
 	
 	// the list of files (the result)
 	var first = true;
 	var files = new ArrayList();
-	var SourceVisitor = Java.extend(SimpleFileVisitor, {
+	
+	visitFileTree(baseDir, {
 		
 		preVisitDirectory: function(dir, attrs){
 			// Skip first entry (root dir)
@@ -239,22 +252,19 @@ function readSourceDirectory(baseDir, updateFunction){
 			files.add(entry);
 			updateFunction(entry);
 			return FileVisitResult.CONTINUE;
-		},
-		
-		visitFileFailed: visitFileFailed
+		}
 	});
-	Files.walkFileTree(baseDir, new SourceVisitor());
 	return files;
 }
 
 // reads all files created in the last backup, if any
 function readLastDirectory(baseDir){
+	var lastIndex = new HashMap();
 	if (!config.incremental || !Files.isDirectory(baseDir)){
-		return null;
+		return lastIndex;
 	}
 	// a map of the files of the last backup for comparisons
-	var lastIndex = new HashMap();
-	var LastVisitor = Java.extend(SimpleFileVisitor, {
+	visitFileTree(baseDir, {
 		
 		visitFile: function(file, attrs){
 			if (attrs.isOther()){
@@ -263,20 +273,18 @@ function readLastDirectory(baseDir){
 			} 
 			lastIndex.put(baseDir.relativize(file).toString(), Entry.createAttributes(attrs));
 			return FileVisitResult.CONTINUE;
-		},
-		
-		visitFileFailed: visitFileFailed
+		}
 	});
-	Files.walkFileTree(baseDir, new LastVisitor());
 	return lastIndex;
 }
 
 function readExistingDirectory(baseDir) {
-	if (!Files.isDirectory(baseDir)){
-		return null;
-	}
 	var result = new HashMap();
-	var ExistingVisitor = Java.extend(SimpleFileVisitor, {
+	if (!Files.isDirectory(baseDir)){
+		return result;
+	}
+
+	visitFileTree(baseDir, {
 		
 		preVisitDirectory: function(dir, attrs){
 			result.put(baseDir.relativize(dir).toString(), DIR_ATTRIBUTES);
@@ -286,11 +294,8 @@ function readExistingDirectory(baseDir) {
 		visitFile: function(file, attrs){
 			result.put(baseDir.relativize(file).toString(), Entry.createAttributes(attrs));
 			return FileVisitResult.CONTINUE;
-		},
-		
-		visitFileFailed: visitFileFailed
-	})
-	Files.walkFileTree(baseDir, new ExistingVisitor());
+		}
+	});
 	return result;
 }
 
@@ -361,7 +366,9 @@ function processSource(sourceDir){
 	var readLast = CompletableFuture.supplyAsync(function() readLastDirectory(Source.last), threadpool);
 	
 	var writeTasks = readSource.thenCombine(readExisting, function(entries, existIndex){
-		if (!existIndex)  {		
+		if (existIndex.isEmpty()) {		
+			// default - target does not exist
+			
 			// create base target dir
 			if (sourceIsRoot){
 				// Cannot copy an fs-root, just create a new directory
@@ -370,46 +377,56 @@ function processSource(sourceDir){
 				// Copy the dir with attributes (but not contents)
 				Files.copy(sourceDir, Source.target, StandardCopyOption.COPY_ATTRIBUTES);
 			}
-		} else {
-			printf('Number of existing files: %d', existIndex.size());
-	
-			var oldSize = entries.size();
-			var oldBytes = size.getAndSet(0);
-			// evaluate existing
-			entries = entries.parallelStream().filter(function(entry){
-				var attr = existIndex.get(Entry.file(entry));
-				if (attr !== null && Entry.sameAttributes(entry, attr)){
-					return false;
-				}
-				size.addAndGet(Entry.size(entry));
-				return true;
-			}).collect(Collectors.toList());
-			
+			return entries;
+		}
+		
+		// Target already exists
+		printf('Number of existing files: %d', existIndex.size());
+
+		// evaluate existing
+		var oldSize = entries.size();
+		var oldBytes = size.getAndSet(0);
+		entries = entries.parallelStream().filter(function(entry){
+			var attr = existIndex.get(Entry.file(entry));
+			if (attr !== null && Entry.sameAttributes(entry, attr)){
+				return false;
+			}
+			size.addAndGet(Entry.size(entry));
+			return true;
+		}).collect(Collectors.toList());
+		if (entries.size() < oldSize){
 			printf('Some of the files are already existing (Count: %d -> %d, Size: %d -> %d MB) from %s', oldSize, entries.size(), toMb(oldSize), toMb(size.get()), Source.last);
 		}
 		return entries;
 	}).thenCombine(readLast, function(entries, lastIndex) {
-		if (lastIndex){
-			
-			// evaluate lastIndex
-			printf('Number of last files: %d', lastIndex.size());
-			var oldBytes = size.getAndSet(0);
-			entries.parallelStream().forEach(function(entry){
-				if (Entry.isDirectory(entry)){
-					return;
-				}
-				// regular file: check if an identical backup exists.
-				// if so, then copy will create a hardlink
-				var last = lastIndex.get(Entry.file(entry));
-				if (last !== null) {
-					Entry.updateAttributes(entry, last);
-				}
-				size.addAndGet(Entry.size(entry));
-			});
+		if (lastIndex.isEmpty()){
+			return entries;
+		}
+		// evaluate lastIndex
+		printf('Number of last files: %d', lastIndex.size());
+		var oldBytes = size.getAndSet(0);
+		entries.parallelStream().forEach(function(entry){
+			if (Entry.isDirectory(entry)){
+				return;
+			}
+			// regular file: check if an identical backup exists.
+			// if so, then copy will create a hardlink
+			var last = lastIndex.get(Entry.file(entry));
+			if (last !== null) {
+				Entry.updateAttributes(entry, last);
+			}
+			size.addAndGet(Entry.size(entry));
+		});
+		if (size.get() < oldBytes){
 			printf('Some of the files will be hardlinked instead of copied (%d -> %d MB) from %s', oldBytes, toMb(size.get()), Source.last);
 		}
 		return entries;
 	}).join();
+	
+	if (writeTasks.isEmpty()){
+		printf('No source files where found. Stop processing');
+		return;
+	}
 	
 	var byteSize = size.get();
 	var byteSizeInMb = toMb(byteSize);
@@ -451,11 +468,10 @@ function processSource(sourceDir){
 		return threadpool.submit(new Callable(function() {
 			createFile(entry);
 			writeCounter(entry);
-			return null;
 		}));
 	});
 	// Wait for all tasks to terminate
-	writeTasks.replaceAll(function (f) {
+	writeTasks.replaceAll(function (future) {
 		try {
 			future.get();
 		} catch (ex) {
@@ -473,7 +489,6 @@ Files.createDirectories(targetDir);
 // start the processing
 config.sources.forEach(processSource);
 
-	
 printf('Set last to new dir: %s -> %s', lastDir, targetDir);
 Files.deleteIfExists(lastDir);
 Files.createSymbolicLink(lastDir, targetDir);
