@@ -7,6 +7,7 @@ var JLongArray = Java.type('long[]');
 var JString = Java.type('java.lang.String');
 var Thread = Java.type('java.lang.Thread');
 var System = Java.type('java.lang.System');
+var Runtime = Java.type('java.lang.Runtime');
 
 var Objects = Java.type('java.util.Objects');
 var Arrays = Java.type('java.util.Arrays');
@@ -43,6 +44,17 @@ var AccessDeniedException = Java.type('java.nio.file.AccessDeniedException');
 // globals
 var config = JSON.parse(new JString(Files.readAllBytes(Paths.get('backup-config.json'))));
 var today = LocalDateTime.now().format(DateTimeFormatter.BASIC_ISO_DATE);
+
+// global threadpool with daemon threads, auto-closed on JVM-shutdown
+var threadpool = Executors.newFixedThreadPool(Math.max(1, config.parallelism), function(runnable){
+	var t = new Thread(runnable);
+	t.setDameon(true);
+	return t;
+});
+Runtime.getRuntime().addShutdownHook(new Thread(new Runnable(new function() {
+	threadpool.shutdown();
+	threadpool.awaitTermination(60, TimeUnit.SECONDS);
+})));
 
 // global dirs
 var targetDir = Paths.get(config.target, today);
@@ -186,46 +198,6 @@ var Entry = {
 	}
 }
 
-/**
-* Wraps all functions in Callables, submits them to the threadpool and waits for their completion
-*/
-var threadpool = null;
-function runParallel(functionList){
-	functionList.replaceAll(function(f) {
-		var future = threadpool.submit(new Callable(f));
-		return !f.onComplete ? future : [future, f.onComplete];
-	});
-	functionList.replaceAll(function (f) {
-		var future;
-		var onComplete;
-		if (f instanceof Future){
-			future = f;
-			onComplete = null;
-		} else {
-			future = f[0];
-			onComplete = f[1];
-		}
-		var result;
-		try {
-			result = future.get();
-		} catch (ex) {
-			// unwrap the execution exception
-			if (ex.getCause() != null){
-				ex = ex.getCause();
-			}
-			ex.printStackTrace();
-		}
-		if (onComplete){
-			try {
-				onComplete(result);
-			} catch (ex) {
-				ex.printStackTrace();
-			}
-		}
-		return null;
-	});
-}
-
 // If any of the file walks fails, the corresponding exceptions are handled here
 function visitFileFailed(file, ioe){
 	if (ioe instanceof AccessDeniedException){
@@ -339,7 +311,9 @@ function createFile(entry){
 		
 		// create or link the file / dir
 		Entry.copy(entry);	
-		
+	} catch (ex) {
+		printf('File creation failed: %s', file);
+		ex.printStackTrace();
 	} finally {
 		// if this was a dir, then do not track it any longer
 		if (Entry.isDirectory(entry)){	
@@ -382,87 +356,65 @@ function processSource(sourceDir){
 	}
 	
 	// prepare tasks
-	var readSource = function() readSourceDirectory(sourceDir, readCounter);
-	var writeTasks = null;
-	readSource.onComplete = function(result){
-		writeTasks = result;
-	};
+	var readSource = CompletableFuture.supplyAsync(function() readSourceDirectory(sourceDir, readCounter), threadpool);
+	var readExisting = CompletableFuture.supplyAsync(function() readExistingDirectory(Source.target), threadpool);
+	var readLast = CompletableFuture.supplyAsync(function() readLastDirectory(Source.last), threadpool);
 	
-	var readLast = function() readLastDirectory(Source.last);
-	var lastIndex = null;
-	readLast.onComplete = function(result){
-		lastIndex = result;
-	};
+	var writeTasks = readSource.thenCombine(readExisting, function(entries, existIndex){
+		if (!existIndex)  {		
+			// create base target dir
+			if (sourceIsRoot){
+				// Cannot copy an fs-root, just create a new directory
+				Files.createDirectory(Source.target);
+			} else {
+				// Copy the dir with attributes (but not contents)
+				Files.copy(sourceDir, Source.target, StandardCopyOption.COPY_ATTRIBUTES);
+			}
+		} else {
+			printf('Number of existing files: %d', existIndex.size());
 	
-	var readExisting = function() readExistingDirectory(Source.target);
-	var existIndex = null;
-	readExisting.onComplete = function(result){
-		existIndex = result;
-	};
-	runParallel(Arrays.asList(readSource, readLast, readExisting));
+			var oldSize = entries.size();
+			var oldBytes = size.getAndSet(0);
+			// evaluate existing
+			entries = entries.parallelStream().filter(function(entry){
+				var attr = existIndex.get(Entry.file(entry));
+				if (attr !== null && Entry.sameAttributes(entry, attr)){
+					return false;
+				}
+				size.addAndGet(Entry.size(entry));
+				return true;
+			}).collect(Collectors.toList());
+			
+			printf('Some of the files are already existing (Count: %d -> %d, Size: %d -> %d MB) from %s', oldSize, entries.size(), toMb(oldSize), toMb(size.get()), Source.last);
+		}
+		return entries;
+	}).thenCombine(readLast, function(entries, lastIndex) {
+		if (lastIndex){
+			
+			// evaluate lastIndex
+			printf('Number of last files: %d', lastIndex.size());
+			var oldBytes = size.getAndSet(0);
+			entries.parallelStream().forEach(function(entry){
+				if (Entry.isDirectory(entry)){
+					return;
+				}
+				// regular file: check if an identical backup exists.
+				// if so, then copy will create a hardlink
+				var last = lastIndex.get(Entry.file(entry));
+				if (last !== null) {
+					Entry.updateAttributes(entry, last);
+				}
+				size.addAndGet(Entry.size(entry));
+			});
+			printf('Some of the files will be hardlinked instead of copied (%d -> %d MB) from %s', oldBytes, toMb(size.get()), Source.last);
+		}
+		return entries;
+	}).join();
 	
 	var byteSize = size.get();
 	var byteSizeInMb = toMb(byteSize);
 	var filesSize = writeTasks.size();
 	printf('%6d files read (%6d MB)', filesSize, byteSizeInMb);
-	
-	if (!existIndex){
-		printf('Number of existing files: %d', existIndex.size());
-		
-		// create base target dir
-		if (sourceIsRoot){
-			// Cannot copy an fs-root, just create a new directory
-			Files.createDirectory(Source.target);
-		} else {
-			// Copy the dir with attributes (but not contents)
-			Files.copy(sourceDir, Source.target, StandardCopyOption.COPY_ATTRIBUTES);
-		}
-	} else {
-		size.set(0);
-		// evaluate existing
-		writeTasks = writeTasks.parallelStream().filter(function(entry){
-			var attr = existIndex.get(Entry.file(entry));
-			if (attr !== null && Entry.sameAttributes(entry, attr)){
-				return false;
-			}
-			size.addAndGet(Entry.size(entry));
-			return true;
-		}).collect(Collectors.toList());
-		
-		// existing can be gc'ed
-		existIndex = null;
-		
-		var oldSize = byteSizeInMb;
-		byteSize = size.get();
-		byteSizeInMb = toMb(byteSize);
-		printf('Some of the files are already existing (Count: %d -> %d, Size: %d -> %d MB) from %s', filesSize, writeTasks.size(), oldSize, byteSizeInMb, Source.last);
-		filesSize = writeTasks.size();
-	}
-	
-	// evaluate lastIndex
-	if (lastIndex){
-		printf('Number of last files: %d', lastIndex.size());
-		
-		size.set(0);
-		writeTasks.parallelStream().forEach(function(entry){
-			if (Entry.isDirectory(entry)){
-				return;
-			}
-			// regular file: check if an identical backup exists.
-			// if so, then copy will create a hardlink
-			var last = lastIndex.get(Entry.file(entry));
-			if (last !== null) {
-				Entry.updateAttributes(entry, last);
-			}
-			size.addAndGet(Entry.size(entry));
-		});
-		// lastIndex can be gc'ed
-		lastIndex = null;
-		var oldSize = byteSizeInMb;
-		byteSize = size.get();
-		byteSizeInMb = toMb(byteSize);
-		printf('Some of the files will be hardlinked instead of copied (%d -> %d MB) from %s', oldSize, byteSizeInMb, Source.last);
-	}
 	
 	printf('%s: Create %s files and directories (%d MB) in %s...', sourceName, filesSize, byteSizeInMb, Source.target);
 	
@@ -488,31 +440,39 @@ function processSource(sourceDir){
 			var timeByFiles = (filesSize / pos) * timeTaken;
 			var timeEstimate = DoubleStream.of(timeBySize, timeByFiles).average().getAsDouble();
 			var timeRemaining = timeEstimate - timeTaken;
-			printf('%10d / %10d files created (%6d / %6d MB). Time: %s / %s. Remaining: %s', pos, filesSize, toMb(sz), byteSizeInMb, formatTime(timeTaken), formatTime(timeEstimate), formatTime(timeRemaining));
+			printf('%10d / %10d files created (%6d / %6d MB). Time: %s / %s. Remaining: %s',
+				pos, filesSize, toMb(sz), byteSizeInMb,
+				formatTime(timeTaken), formatTime(timeEstimate), formatTime(timeRemaining));
 		}
 	}
 	
+	// Submit all tasks
 	writeTasks.replaceAll(function(entry){
-		return function() {
+		return threadpool.submit(new Callable(function() {
 			createFile(entry);
 			writeCounter(entry);
-		}
+			return null;
+		}));
 	});
-	runParallel(writeTasks);
+	// Wait for all tasks to terminate
+	writeTasks.replaceAll(function (f) {
+		try {
+			future.get();
+		} catch (ex) {
+			ex.printStackTrace();
+		}
+		return null;
+	});
+
 	printf('%10d / %10d files created (%6d / %6d MB).', count.get(), filesSize, toMb(size.get()), byteSizeInMb);
 	printf('%s: Done.', sourceDir);
 }
 
 // the target dir to write to
 Files.createDirectories(targetDir);
+// start the processing
+config.sources.forEach(processSource);
 
-// Start the threadpool and do stuff!
-threadpool = Executors.newFixedThreadPool(Math.max(1, config.parallelism));
-try {
-	config.sources.forEach(processSource);
-} finally {
-	threadpool.shutdown();
-}
 	
 printf('Set last to new dir: %s -> %s', lastDir, targetDir);
 Files.deleteIfExists(lastDir);
