@@ -45,32 +45,50 @@ var AccessDeniedException = Java.type('java.nio.file.AccessDeniedException');
 
 // globals
 var config = JSON.parse(new JString(Files.readAllBytes(Paths.get('backup-config.json'))));
-var today = LocalDateTime.now().format(DateTimeFormatter.BASIC_ISO_DATE);
- today = '20170512'
+var logInterval = config.logInterval ? Math.max(1, config.logInterval) : 60;
+
+var targetName = LocalDateTime.now().format(DateTimeFormatter.BASIC_ISO_DATE);
 
 // global threadpool with daemon threads, auto-closed on JVM-shutdown
-var threadpool = Executors.newFixedThreadPool(Math.max(1, config.parallelism), function(runnable){
+var threadFactory = function(runnable){
 	var t = new Thread(runnable);
 	t.setDaemon(true);
 	return t;
-});
+};
+var threadpool = Executors.newFixedThreadPool(Math.max(1, config.parallelism), threadFactory);
+// log scheduler for read / write progress
+var scheduler = Executors.newScheduledThreadPool(1, threadFactory);
 Runtime.getRuntime().addShutdownHook(new Thread(new Runnable(function() {
 	threadpool.shutdown();
-	threadpool.awaitTermination(1, TimeUnit.SECONDS);
-	threadpool.shutdownNow();
-	threadpool.awaitTermination(1, TimeUnit.SECONDS);
+	scheduler.shutdown();
+	[threadpool, scheduler].forEach(function(pool) {
+		pool.awaitTermination(1, TimeUnit.SECONDS);
+		pool.shutdownNow();
+		pool.awaitTermination(1, TimeUnit.SECONDS);
+	});
 })));
 
-// global dirs
-var targetDir = Paths.get(config.target, today);
-var lastDir = Paths.get(config.target, 'last');
+/**
+* Hands over an info count to be run after each log interval
+*/
+function scheduleInfo(task){
+	var scheduledFuture = scheduler.scheduleWithFixedDelay(task, logInterval, logInterval, TimeUnit.SECONDS);
+	return {
+		cancel: function() scheduledFuture.cancel(false)
+	};
+}
 
-var readSize = 10000;
-var writeSize = 1000;
+// global dirs
+var targetDir = Paths.get(config.target, targetName);
+var lastDir = Paths.get(config.target, 'last');
 
 var ONE_MB = 1024 * 1024;
 function toMb(bytes){
 	return (bytes / ONE_MB) | 0;
+}
+
+function synchronized(monitor, block){
+	Java.synchronized(block, monitor)();
 }
 
 /**
@@ -158,6 +176,7 @@ var Entry = {
 	/**
 	* Check if the other entry has the same attributes as this one.
 	* If so, then the copy step will create a link.
+	* @return true if both attributes are identical
 	*/	
 	updateAttributes: function(entry, otherAttributes) {
 		// printf('%s: %s = %s', entry.key, Arrays.toString(entry.value), Arrays.toString(otherAttributes));
@@ -165,9 +184,11 @@ var Entry = {
 		// if the file is identical, the link attributes whill be used:
 		// - then link will be created
 		// - otherwise a normal copy occurs (as in dirs)
-		if (Entry.sameAttributes(entry, otherAttributes)){
+		var result = Entry.sameAttributes(entry, otherAttributes);
+		if (result){
 			entry.value = LINK_ATTRIBUTES;
 		}
+		return result;
 	},
 	
 	/**
@@ -222,7 +243,6 @@ function visitFileTree(baseDir, visitor){
 }
 
 // tracks which parent dirs do not yet exist (for next step)
-var parentDirs = Collections.newSetFromMap(new ConcurrentHashMap());
 function readSourceDirectory(baseDir, updateFunction){
 	
 	// the list of files (the result)
@@ -302,33 +322,36 @@ function readExistingDirectory(baseDir) {
 /**
 * First waits for the existence of the parent dir, then copies either the file or the directory (without content)
 */
-function createFile(entry){
+function createFile(parentLockMap, entry){
 	var file = Entry.file(entry);
 	try {
 		// wait until the parent dir exists (-> is no longer in the dir index)
-		if (!file.isEmpty()){
-			var parent = Objects.toString(new File(file).getParent(), '');
-			// printf("%s, parent: %s", file, parent);
-			while (parentDirs.contains(parent)){
-				Thread.sleep(1);
-			}
+		var parent = Objects.toString(new File(file).getParent(), '');
+		var lock = parentLockMap.get(parent);
+		if (lock){			
+			synchronized(lock, function() {
+				while (parentLockMap.containsKey(parent)){
+					lock.wait(1);
+				}
+			});
 		}
 		
 		// create or link the file / dir
 		Entry.copy(entry);	
+		
 	} catch (ex) {
 		printf('File creation failed: %s', file);
 		ex.printStackTrace();
 	} finally {
-		// if this was a dir, then do not track it any longer
-		if (Entry.isDirectory(entry)){	
-			// Do not longer track parentDir as nonexistant
-			parentDirs.remove(file);
+		// if entry is a dir, then do not track it any longer as nonexistant
+		if (Entry.isDirectory(entry)){
+			var lock = parentLockMap.remove(file);
+			synchronized(lock, function() {
+				lock.notifyAll();
+			});
 		}
 	}
 }
-
-
 
 function processSource(sourceDir){
 	sourceDir = Paths.get(sourceDir);
@@ -350,22 +373,27 @@ function processSource(sourceDir){
 	printf('Create backup from %s %s to %s', sourceIsRoot ? 'filesystem' : 'directory', sourceDir, Source.target);
 	
 	printf('%s: Check files and dirs for backup...', sourceName);
+	
 	var size = new AtomicLong();
 	var count = new AtomicLong();
-	var readCounter = function(entry) {
-		var sz = size.addAndGet(Entry.size(entry));
-		var pos = count.incrementAndGet();
-		if (pos % readSize === 0){
-			printf('%6d files read (%6d MB)', pos, toMb(sz));
-		}
-	}
+	var schedule = scheduleInfo(function() {
+		printf('%6d files read (%6d MB).', count.get(), toMb(size.get()));
+	});
 	
 	// prepare tasks
-	var readSource = CompletableFuture.supplyAsync(function() readSourceDirectory(sourceDir, readCounter), threadpool);
+	var readSource = CompletableFuture.supplyAsync(function() {
+		return readSourceDirectory(sourceDir, function(entry) {
+			size.addAndGet(Entry.size(entry));
+			count.incrementAndGet();
+		});
+	}, threadpool);
 	var readExisting = CompletableFuture.supplyAsync(function() readExistingDirectory(Source.target), threadpool);
 	var readLast = CompletableFuture.supplyAsync(function() readLastDirectory(Source.last), threadpool);
 	
 	var writeTasks = readSource.thenCombine(readExisting, function(entries, existIndex){
+		schedule.cancel();
+		printf('Read %d files and directories (%d MB). Done.', count.get(), toMb(size.get()));
+		
 		if (existIndex.isEmpty()) {		
 			// default - target does not exist
 			
@@ -395,81 +423,76 @@ function processSource(sourceDir){
 			return true;
 		}).collect(Collectors.toList());
 		if (entries.size() < oldSize){
-			printf('Some of the files are already existing (Count: %d -> %d, Size: %d -> %d MB) from %s', oldSize, entries.size(), toMb(oldSize), toMb(size.get()), Source.last);
+			printf('Some of the files are already existing (Count: %d -> %d, Size: %d -> %d MB) from %s', oldSize, entries.size(), toMb(oldBytes), toMb(size.get()), Source.last);
 		}
 		return entries;
 	}).thenCombine(readLast, function(entries, lastIndex) {
-		if (lastIndex.isEmpty()){
+		if (entries.isEmpty() || lastIndex.isEmpty()){
 			return entries;
 		}
 		// evaluate lastIndex
 		printf('Number of last files: %d', lastIndex.size());
 		var oldBytes = size.getAndSet(0);
-		entries.parallelStream().forEach(function(entry){
-			if (Entry.isDirectory(entry)){
-				return;
-			}
+		// get regular files
+		var files = entries.parallelStream().filter(function(entry) !Entry.isDirectory(entry)).collect(Collectors.toList());
+		// update and count links
+		var linkCount = files.parallelStream().filter(function(entry){
 			// regular file: check if an identical backup exists.
 			// if so, then copy will create a hardlink
 			var last = lastIndex.get(Entry.file(entry));
-			if (last !== null) {
-				Entry.updateAttributes(entry, last);
-			}
+			var link = last && Entry.updateAttributes(entry, last);
 			size.addAndGet(Entry.size(entry));
-		});
+			return link;
+		}).count();
 		if (size.get() < oldBytes){
-			printf('Some of the files will be hardlinked instead of copied (%d -> %d MB) from %s', oldBytes, toMb(size.get()), Source.last);
+			printf('%d of %d files will be hardlinked instead of copied (%d -> %d MB) from %s', linkCount, files.size(), toMb(oldBytes), toMb(size.get()), Source.last);
 		}
 		return entries;
 	}).join();
 	
 	if (writeTasks.isEmpty()){
-		printf('No source files where found. Stop processing');
+		printf('No source files were found. Stop processing.');
 		return;
 	}
 	
 	var byteSize = size.get();
 	var byteSizeInMb = toMb(byteSize);
 	var filesSize = writeTasks.size();
-	printf('%6d files read (%6d MB)', filesSize, byteSizeInMb);
 	
 	printf('%s: Create %s files and directories (%d MB) in %s...', sourceName, filesSize, byteSizeInMb, Source.target);
 	
 	// evaluate parent dirs
-	parentDirs.clear();
-	writeTasks.parallelStream().forEach(function(entry){
-		if (Entry.isDirectory(entry)){
-			parentDirs.add(Entry.file(entry));
-		}
-	});
+	var parentLockMap = writeTasks.parallelStream()
+		.filter(function(entry) Entry.isDirectory(entry))
+		.collect(Collectors.toConcurrentMap(function(entry) Entry.file(entry), function(entry) entry));
 	
 	// System.gc();
 	// System.console().readLine('Hit enter to continue');
 	size.set(0);
 	count.set(0);
 	var startTime = System.currentTimeMillis();
-	var writeCounter = function(entry){
-		var sz = size.addAndGet(Entry.size(entry));
-		var pos = count.incrementAndGet();
-		if (pos % writeSize === 0){
-			var timeTaken = System.currentTimeMillis() - startTime;
-			var timeBySize = (byteSize / sz) * timeTaken;
-			var timeByFiles = (filesSize / pos) * timeTaken;
-			var timeEstimate = DoubleStream.of(timeBySize, timeByFiles).average().getAsDouble();
-			var timeRemaining = timeEstimate - timeTaken;
-			printf('%10d / %10d files created (%6d / %6d MB). Time: %s / %s. Remaining: %s',
-				pos, filesSize, toMb(sz), byteSizeInMb,
-				formatTime(timeTaken), formatTime(timeEstimate), formatTime(timeRemaining));
-		}
-	}
-	
+	schedule = scheduleInfo(function() {
+		var sz = size.get();
+		var pos = count.get();
+		var timeTaken = System.currentTimeMillis() - startTime;
+		var timeBySize = (byteSize / sz) * timeTaken;
+		var timeByFiles = (filesSize / pos) * timeTaken;
+		var timeEstimate = DoubleStream.of(timeBySize, timeByFiles).average().getAsDouble();
+		var timeRemaining = timeEstimate - timeTaken;
+		printf('%10d / %10d files created (%6d / %6d MB). Time: %s / %s. Remaining: %s',
+			pos, filesSize, toMb(sz), byteSizeInMb,
+			formatTime(timeTaken), formatTime(timeEstimate), formatTime(timeRemaining));
+	});
+
 	// Submit all tasks
 	writeTasks.replaceAll(function(entry){
 		return threadpool.submit(new Callable(function() {
-			createFile(entry);
-			writeCounter(entry);
+			createFile(parentLockMap, entry);
+			size.addAndGet(Entry.size(entry));
+			count.incrementAndGet();
 		}));
 	});
+	
 	// Wait for all tasks to terminate
 	writeTasks.replaceAll(function (future) {
 		try {
@@ -479,8 +502,9 @@ function processSource(sourceDir){
 		}
 		return null;
 	});
+	schedule.cancel();
 
-	printf('%10d / %10d files created (%6d / %6d MB).', count.get(), filesSize, toMb(size.get()), byteSizeInMb);
+	printf('Created %d files and directories (%d MB).', count.get(), toMb(size.get()));
 	printf('%s: Done.', sourceDir);
 }
 
